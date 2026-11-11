@@ -8,7 +8,7 @@ use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use ashpd::desktop::PersistMode;
+use ashpd::desktop::{PersistMode, Session};
 use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
 
 /// Everything the capture needs to start.
@@ -17,6 +17,18 @@ pub struct PortalStream {
     pub fd: OwnedFd,
     /// Size of the captured screen, in logical pixels (if the portal provides it).
     pub size: Option<(i32, i32)>,
+    /// The portal session must stay alive while recording: if it's dropped,
+    /// the D-Bus connection may close and the portal stops the stream.
+    session: Session<Screencast>,
+    _proxy: Screencast,
+}
+
+impl PortalStream {
+    /// Tells the portal we're done (removes the "screen is shared" indicator).
+    pub async fn close(self) -> Result<()> {
+        self.session.close().await?;
+        Ok(())
+    }
 }
 
 /// File where the "restore token" is stored: it lets the portal remember
@@ -31,7 +43,7 @@ fn load_token() -> Option<String> {
 }
 
 fn save_token(token: &str) -> Result<()> {
-    let path = token_path().context("impossible de trouver le dossier ~/.local/state")?;
+    let path = token_path().context("cannot find the ~/.local/state directory")?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -46,8 +58,8 @@ pub async fn open() -> Result<PortalStream> {
 
     let token = load_token();
     println!(
-        "Restore token précédent : {}",
-        if token.is_some() { "oui" } else { "aucun" }
+        "Previous restore token: {}",
+        if token.is_some() { "found" } else { "none" }
     );
 
     proxy
@@ -68,21 +80,21 @@ pub async fn open() -> Result<PortalStream> {
         .start(&session, None, Default::default())
         .await?
         .response()
-        .context("la capture a été refusée ou annulée")?;
+        .context("screen capture was denied or cancelled")?;
 
     // The portal returns a new token every time (the previous one becomes invalid).
     match response.restore_token() {
         Some(new_token) => {
             save_token(new_token)?;
-            println!("Nouveau restore token enregistré.");
+            println!("New restore token saved.");
         }
-        None => println!("Le portail n'a pas fourni de restore token."),
+        None => println!("The portal did not provide a restore token."),
     }
 
     let stream = response
         .streams()
         .first()
-        .context("aucun écran sélectionné")?
+        .context("no screen selected")?
         .to_owned();
 
     let fd = proxy
@@ -93,5 +105,7 @@ pub async fn open() -> Result<PortalStream> {
         node_id: stream.pipe_wire_node_id(),
         fd,
         size: stream.size(),
+        session,
+        _proxy: proxy,
     })
 }
