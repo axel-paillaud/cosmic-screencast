@@ -146,7 +146,9 @@ pub fn run(
             }
 
             let datas = buffer.datas_mut();
-            let Some(data) = datas.first_mut() else { return };
+            let Some(data) = datas.first_mut() else {
+                return;
+            };
             let stride = data.chunk().stride() as usize;
             let offset = data.chunk().offset() as usize;
             let size = data.chunk().size() as usize;
@@ -211,9 +213,18 @@ pub fn run(
             Choice,
             Range,
             Rectangle,
-            spa::utils::Rectangle { width: 1920, height: 1080 },
-            spa::utils::Rectangle { width: 1, height: 1 },
-            spa::utils::Rectangle { width: 8192, height: 8192 }
+            spa::utils::Rectangle {
+                width: 1920,
+                height: 1080
+            },
+            spa::utils::Rectangle {
+                width: 1,
+                height: 1
+            },
+            spa::utils::Rectangle {
+                width: 8192,
+                height: 8192
+            }
         ),
         spa::pod::property!(
             spa::param::format::FormatProperties::VideoFramerate,
@@ -222,7 +233,10 @@ pub fn run(
             Fraction,
             spa::utils::Fraction { num: fps, denom: 1 },
             spa::utils::Fraction { num: 0, denom: 1 },
-            spa::utils::Fraction { num: 1000, denom: 1 }
+            spa::utils::Fraction {
+                num: 1000,
+                denom: 1
+            }
         ),
     );
     let bytes: Vec<u8> = spa::pod::serialize::PodSerializer::serialize(
@@ -268,7 +282,11 @@ fn crop_to_rgba(
     };
     let frame_w = format.size().width;
     let frame_h = format.size().height;
-    let stride = if stride == 0 { frame_w as usize * 4 } else { stride };
+    let stride = if stride == 0 {
+        frame_w as usize * 4
+    } else {
+        stride
+    };
 
     // Convert the logical region to physical pixels, then clamp it to the frame.
     let (x, y, w, h) = match options.region {
@@ -291,7 +309,11 @@ fn crop_to_rgba(
         let start = row as usize * stride + x as usize * 4;
         let line = bytes.get(start..start + w as usize * 4)?;
         for px in line.chunks_exact(4) {
-            let (r, g, b) = if bgr { (px[2], px[1], px[0]) } else { (px[0], px[1], px[2]) };
+            let (r, g, b) = if bgr {
+                (px[2], px[1], px[0])
+            } else {
+                (px[0], px[1], px[2])
+            };
             // "x" formats have no reliable alpha: force full opacity.
             pixels.push(RGBA8::new(r, g, b, 255));
         }

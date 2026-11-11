@@ -8,8 +8,8 @@ use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use ashpd::desktop::{PersistMode, Session};
 use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
+use ashpd::desktop::{PersistMode, Session};
 
 /// Everything the capture needs to start.
 pub struct PortalStream {
@@ -39,7 +39,9 @@ fn token_path() -> Option<PathBuf> {
 
 fn load_token() -> Option<String> {
     let path = token_path()?;
-    std::fs::read_to_string(path).ok().map(|s| s.trim().to_owned())
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_owned())
 }
 
 fn save_token(token: &str) -> Result<()> {

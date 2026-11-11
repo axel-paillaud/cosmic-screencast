@@ -13,6 +13,13 @@ imgref = "1.12.3"
 jiff = "0.2.43"
 pipewire = "0.10.1"
 rgb = "0.8.53"
+# COSMIC's toolkit (not on crates.io). Pinned to a commit so builds are reproducible.
+libcosmic = { git = "https://github.com/pop-os/libcosmic", rev = "1e539b94fb891a91d0182c288140788f97334449", default-features = false, features = [
+    "wayland",
+    "tokio",
+    "wgpu",
+    "dbus-config",
+] }
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "signal", "time"] }
 
 # Optimize dependencies even in debug builds: gifski is very slow unoptimized.

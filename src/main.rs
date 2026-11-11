@@ -1,6 +1,8 @@
 mod capture;
 mod gif;
 mod portal;
+mod selection;
+mod selector;
 
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -16,7 +18,7 @@ use capture::Region;
 #[command(version)]
 struct Args {
     /// Region to record, in screen coordinates: X,Y,WIDTH,HEIGHT.
-    /// Records the whole screen if omitted.
+    /// Shows a selection overlay if omitted.
     #[arg(short, long, value_parser = parse_region)]
     region: Option<Region>,
 
@@ -36,7 +38,7 @@ struct Args {
     #[arg(long)]
     max_width: Option<u32>,
 
-    /// Output file. Defaults to ~/Videos/screencast_<date>.gif.
+    /// Output file. Defaults to ~/Videos/Screencasts/screencast_<date>.gif.
     #[arg(short, long)]
     output: Option<PathBuf>,
 }
@@ -59,24 +61,51 @@ fn parse_region(s: &str) -> Result<Region, String> {
     }
 }
 
-fn default_output() -> PathBuf {
+/// Same convention as COSMIC screenshots (~/Pictures/Screenshots).
+/// `video_dir()` follows the XDG user dirs, so it's localized (~/Vidéos).
+fn default_output() -> Result<PathBuf> {
     let dir = dirs::video_dir()
         .or_else(dirs::home_dir)
-        .unwrap_or_else(|| PathBuf::from("."));
+        .context("cannot find the videos directory")?
+        .join("Screencasts");
+    std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
     let now = jiff::Zoned::now().strftime("%Y-%m-%d_%H-%M-%S");
-    dir.join(format!("screencast_{now}.gif"))
+    Ok(dir.join(format!("screencast_{now}.gif")))
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args = Args::parse();
-    let output = args.output.unwrap_or_else(default_output);
 
-    // 1. Ask the portal for screen access (async: goes through D-Bus).
+    // 1. Pick the region. The overlay (libcosmic) runs its own event loop and
+    //    async runtime, so it must run *before* we start ours.
+    let region = match args.region {
+        Some(region) => region,
+        None => match selector::run()? {
+            Some(region) => region,
+            None => {
+                println!("Cancelled.");
+                return Ok(());
+            }
+        },
+    };
+    println!("Region: {region:?}");
+
+    // 2. Record. `#[tokio::main]` is just a shortcut for these two lines.
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(record(args, region))
+}
+
+async fn record(args: Args, region: Region) -> Result<()> {
+    let output = match args.output {
+        Some(path) => path,
+        None => default_output()?,
+    };
+
+    // Ask the portal for screen access (async: goes through D-Bus).
     let stream = portal::open().await?;
     println!("Screen logical size: {:?}", stream.size);
 
-    // 2. Start the encoder. The channel is bounded: a few frames of buffer
+    // Start the encoder. The channel is bounded: a few frames of buffer
     //    between capture and encoding.
     let (frame_tx, frame_rx) = mpsc::sync_channel(8);
     let encoder = gif::spawn(
@@ -88,22 +117,21 @@ async fn main() -> Result<()> {
         },
     );
 
-    // 3. Start the capture. The PipeWire loop is blocking: run it on a
+    // Start the capture. The PipeWire loop is blocking: run it on a
     //    dedicated thread so it doesn't block tokio's async runtime.
     let (stop_tx, stop_rx) = pipewire::channel::channel::<()>();
     let options = capture::Options {
-        region: args.region,
+        region: Some(region),
         logical_size: stream.size,
         fps: args.fps.max(1),
     };
     // `fd` is moved into the thread, but `stream` itself stays here so the
     // portal session lives until the end.
     let (node_id, fd) = (stream.node_id, stream.fd.try_clone()?);
-    let mut capture = tokio::task::spawn_blocking(move || {
-        capture::run(node_id, fd, options, frame_tx, stop_rx)
-    });
+    let mut capture =
+        tokio::task::spawn_blocking(move || capture::run(node_id, fd, options, frame_tx, stop_rx));
 
-    // 4. Wait for Ctrl+C, the duration, or the capture ending by itself.
+    // Wait for Ctrl+C, the duration, or the capture ending by itself.
     let timeout = async {
         match args.duration {
             Some(secs) => tokio::time::sleep(Duration::from_secs_f64(secs)).await,
@@ -125,7 +153,7 @@ async fn main() -> Result<()> {
     }
     stream.close().await?;
 
-    // 5. The capture thread has dropped its sender: the encoder finishes.
+    // The capture thread has dropped its sender: the encoder finishes.
     println!("Encoding GIF...");
     encoder
         .join()
