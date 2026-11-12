@@ -11,6 +11,25 @@ pub struct Region {
 }
 
 impl Region {
+    /// Parses "X,Y,WIDTH,HEIGHT" (spaces allowed). Used by `--region` and by
+    /// the overlay process to send its answer.
+    pub fn parse(s: &str) -> Result<Region, String> {
+        let parts: Vec<u32> = s
+            .split(',')
+            .map(|p| p.trim().parse::<u32>())
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("invalid number: {e}"))?;
+        match parts[..] {
+            [x, y, width, height] if width > 0 && height > 0 => Ok(Region {
+                x,
+                y,
+                width,
+                height,
+            }),
+            _ => Err("expected X,Y,WIDTH,HEIGHT with WIDTH and HEIGHT > 0".into()),
+        }
+    }
+
     /// Converts a logical region to physical pixels of a `frame_size` frame,
     /// clamped so it fits inside the frame.
     ///
@@ -56,6 +75,22 @@ mod tests {
             width,
             height,
         }
+    }
+
+    #[test]
+    fn parses_a_region() {
+        assert_eq!(
+            Region::parse("10, 20,300,200"),
+            Ok(region(10, 20, 300, 200))
+        );
+    }
+
+    #[test]
+    fn rejects_bad_regions() {
+        assert!(Region::parse("10,20,300").is_err()); // 3 numbers
+        assert!(Region::parse("10,20,0,200").is_err()); // zero width
+        assert!(Region::parse("10,-20,300,200").is_err()); // negative
+        assert!(Region::parse("a,b,c,d").is_err());
     }
 
     #[test]

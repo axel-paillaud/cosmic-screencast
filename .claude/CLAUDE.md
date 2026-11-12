@@ -12,11 +12,15 @@ Code, comments, console messages and docs are in English.
 ## Architecture
 
 ```
-main.rs      CLI (clap). Claims the single instance, runs the selector in a child
-             process (`--select-only`), then records (tokio).
+main.rs      CLI (clap). Claims the single instance, picks the region (overlay),
+             records (tokio), notifies.
 instance.rs  Single instance over D-Bus: a second launch calls `Stop` on the first.
+overlay.rs   Runs selector.rs in a child process (`--select-only`); the overlay
+             stays as a recording indicator until the parent drops it.
+notify.rs    Desktop notifications (saved / failed), like cosmic-screenshot.
 selector.rs  libcosmic app, no main window: one fullscreen transparent layer-shell
-             surface (Layer::Overlay, active output). Returns the region via a channel.
+             surface (Layer::Overlay, active output). Sends the region on a channel,
+             then switches to "recording" mode (locked, click-through).
 selection.rs Custom iced widget: draw / move / resize a rectangle. Look copied from
              the screenshot portal (30% black dim, 4px accent border, corner handles).
 portal.rs    XDG ScreenCast portal (ashpd): gets a PipeWire fd + node id.
@@ -71,7 +75,17 @@ Flow: overlay → portal → PipeWire capture ⇄ channel ⇄ gifski → `~/Vide
   and "taken" comes back as `Err(zbus::Error::NameTaken)`, not as a reply.
   Stop during the selection cancels it (the overlay child is `kill_on_drop`).
 - **The overlay runs in a child process** (same binary, hidden `--select-only` flag,
-  prints `REGION x,y,w,h` on stdout). After `cosmic::app::run()` returns, libcosmic's
+  prints `REGION x,y,w,h` or `REGION full` on stdout, then stays alive as the recording indicator:
+  `set_input_zone(Some(vec![]))` = click-through, keyboard interactivity None, no
+  handles/toolbar). The parent drops it (`kill_on_drop`) when the capture stops; the
+  child also exits when its stdin closes (parent died), so it never stays stuck.
+  Dim + border are drawn **outside** the region (2 px gap, border outside the gap):
+  the recording is cropped to the region, so the overlay never appears in the GIF.
+  Whole screen = `None` all the way to `capture::Options.region` (the frame size
+  is used): libcosmic does NOT call `on_window_resize` for layer surfaces, so the
+  overlay doesn't know the screen size. Corner handles sit on the border's outer
+  corners (`handle_centers`).
+  Originally a child process because after `cosmic::app::run()` returns, libcosmic's
   Wayland event-loop thread (`SctkEventLoop`) keeps running and touches freed Wayland
   objects: random crashes during recording (glibc `tpp.c` assertion in
   `wl_display_cancel_read`, SIGSEGV on focus change). Do not run libcosmic in the
@@ -92,18 +106,20 @@ Unit tests cover the pure functions (`region.rs`, `pixels.rs`, `parse_region`).
 ## Roadmap
 
 Done: 1. PipeWire capture · 2. crop + GIF · 3. selection overlay · 4. pacing + DMA-BUF
-· 5. start/stop with the same command (shortcut).
+· 5. start/stop with the same command (shortcut) · 6. notifications · 7. overlay kept
+as recording indicator.
 
 Next:
-- Keep the selection rectangle visible during recording (overlay must not be
-  captured / must not take input).
-- Feedback without a terminal: desktop notification when the GIF is saved (D-Bus
-  `org.freedesktop.Notifications`), maybe one when recording starts.
+- Notifications: an "Open" action (needs to stay alive for `ActionInvoked`), our own
+  icon (currently the themed `media-record`), i18n of the texts.
 - Install the default shortcut (Ctrl+Print) at install time. Panel applet: decided
   not needed for now (cosmic-screenshot has none; demos are short).
 - Optional MP4 output.
 - Multi-monitor: overlay is on the active output, capture is on the portal-remembered
   monitor; they must match.
+- Same menu at bottom screen than cosmic-screenshot, with selector GIF - MP4 (can choose both)
+- Thinking: We could keep the menu visible during the recording, including an 'X' icon, so that clicking it would stop the screencast. This way, if a user doesn't know the keyboard shortcut to start the recording, they won't end up stuck with that box on their screen.
+but it remains to be seen whether this interferes too much with the capture (I don’t think it does). the menu needs to remain invisible, even when it’s part of the selection—is that possible?
 - i18n (fluent, see below), packaging, CPU optimization if needed.
 
 ## COSMIC conventions (see ../cosmic-screenshot for a reference project)

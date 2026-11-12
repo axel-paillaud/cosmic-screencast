@@ -20,7 +20,7 @@ libcosmic = { git = "https://github.com/pop-os/libcosmic", rev = "1e539b94fb891a
     "wgpu",
     "dbus-config",
 ] }
-tokio = { version = "1.54.1", features = ["macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.54.1", features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 libc = "0.2"
 zbus = { version = "6", default-features = false, features = ["tokio"] }
 

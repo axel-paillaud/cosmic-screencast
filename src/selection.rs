@@ -3,6 +3,10 @@
 //! Its look follows the COSMIC screenshot portal: the screen is dimmed except
 //! inside the selection, which gets an accent-colored border and corner handles.
 //!
+//! Everything is drawn *outside* the selection (with a small gap): the overlay
+//! stays visible during the recording, and the recording is cropped to the
+//! selection, so the overlay never shows up in the GIF.
+//!
 //! An iced widget doesn't own the application data: it receives the current
 //! rectangle from the app, and *publishes* a message when the user changes it.
 //! The app then updates its state and rebuilds the view with the new rectangle.
@@ -21,10 +25,14 @@ const HANDLE_SIZE: f32 = 16.0;
 const BORDER_WIDTH: f32 = 4.0;
 /// Opacity of the black layer dimming the non-selected area.
 const DIM_ALPHA: f32 = 0.3;
+/// Space between the selection and what we draw around it. Keeps antialiased
+/// edges out of the recording, even with fractional scaling.
+const GAP: f32 = 2.0;
 
 pub struct Selection<'a, Message> {
     rect: Option<Rectangle>,
     on_change: Box<dyn Fn(Rectangle) -> Message + 'a>,
+    locked: bool,
 }
 
 impl<'a, Message> Selection<'a, Message> {
@@ -32,8 +40,23 @@ impl<'a, Message> Selection<'a, Message> {
         Self {
             rect,
             on_change: Box::new(on_change),
+            locked: false,
         }
     }
+
+    /// Locked: no handles, ignores the mouse (used while recording).
+    pub fn locked(mut self, locked: bool) -> Self {
+        self.locked = locked;
+        self
+    }
+}
+
+/// `r` grown by `by` on every side.
+fn expand(r: Rectangle, by: f32) -> Rectangle {
+    Rectangle::new(
+        Point::new(r.x - by, r.y - by),
+        Size::new(r.width + 2.0 * by, r.height + 2.0 * by),
+    )
 }
 
 /// What the mouse is currently doing. iced stores this in the widget "tree",
@@ -64,9 +87,15 @@ fn corners(r: Rectangle) -> [Point; 4] {
     ]
 }
 
-/// Returns the index of the corner under `p`, if any.
+/// Where the corner handles are drawn: on the outer corners of the border
+/// (the border is outside the selection, see the module docs).
+fn handle_centers(r: Rectangle) -> [Point; 4] {
+    corners(expand(r, GAP + BORDER_WIDTH))
+}
+
+/// Returns the index of the corner handle under `p`, if any.
 fn corner_at(r: Rectangle, p: Point) -> Option<usize> {
-    corners(r)
+    handle_centers(r)
         .iter()
         .position(|c| (c.x - p.x).abs() <= HANDLE_SIZE && (c.y - p.y).abs() <= HANDLE_SIZE)
 }
@@ -106,6 +135,9 @@ impl<Message> Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_,
         shell: &mut Shell<'_, Message>,
         _viewport: &Rectangle,
     ) {
+        if self.locked {
+            return;
+        }
         let drag = tree.state.downcast_mut::<Drag>();
         let bounds = layout.bounds();
         // Cursor position relative to the widget (= to the screen).
@@ -166,6 +198,9 @@ impl<Message> Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_,
         let Some(pos) = cursor.position_in(layout.bounds()) else {
             return mouse::Interaction::None;
         };
+        if self.locked {
+            return mouse::Interaction::None;
+        }
         match (tree.state.downcast_ref::<Drag>(), self.rect) {
             (Drag::Moving { .. }, _) => mouse::Interaction::Grabbing,
             (Drag::Resizing { .. }, _) => mouse::Interaction::Crosshair,
@@ -206,43 +241,55 @@ impl<Message> Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_,
         };
 
         let Some(sel) = self.rect else {
-            // Nothing selected yet: dim the whole screen.
-            fill(renderer, bounds, dim);
+            // Recording the whole screen: nothing to show.
+            // Selecting, nothing selected yet: dim the whole screen.
+            if !self.locked {
+                fill(renderer, bounds, dim);
+            }
             return;
         };
 
-        // Dim around the selection with 4 bands: top, bottom, left, right.
+        // Dim around the selection (+ gap) with 4 bands: top, bottom, left,
+        // right. `max(0.0)`: the bands may go past the screen edges.
+        let outer = expand(sel, GAP);
         let (w, h) = (bounds.width, bounds.height);
-        let bottom = sel.y + sel.height;
-        let right = sel.x + sel.width;
+        let bottom = outer.y + outer.height;
+        let right = outer.x + outer.width;
         fill(
             renderer,
-            Rectangle::new(Point::ORIGIN, Size::new(w, sel.y)),
+            Rectangle::new(Point::ORIGIN, Size::new(w, outer.y.max(0.0))),
             dim,
         );
         fill(
             renderer,
-            Rectangle::new(Point::new(0.0, bottom), Size::new(w, h - bottom)),
+            Rectangle::new(Point::new(0.0, bottom), Size::new(w, (h - bottom).max(0.0))),
             dim,
         );
         fill(
             renderer,
-            Rectangle::new(Point::new(0.0, sel.y), Size::new(sel.x, sel.height)),
+            Rectangle::new(
+                Point::new(0.0, outer.y),
+                Size::new(outer.x.max(0.0), outer.height),
+            ),
             dim,
         );
         fill(
             renderer,
-            Rectangle::new(Point::new(right, sel.y), Size::new(w - right, sel.height)),
+            Rectangle::new(
+                Point::new(right, outer.y),
+                Size::new((w - right).max(0.0), outer.height),
+            ),
             dim,
         );
 
         let cosmic = theme.cosmic();
         let accent = Color::from(cosmic.accent_color());
 
-        // Selection border (drawn inside the rectangle).
+        // Border, outside the gap: a quad's border is drawn inside its bounds,
+        // so the quad is grown by the border width.
         renderer.fill_quad(
             Quad {
-                bounds: sel,
+                bounds: expand(outer, BORDER_WIDTH),
                 border: Border {
                     width: BORDER_WIDTH,
                     color: accent,
@@ -253,8 +300,11 @@ impl<Message> Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_,
             Color::TRANSPARENT,
         );
 
+        if self.locked {
+            return;
+        }
         // Corner handles.
-        for c in corners(sel) {
+        for c in handle_centers(sel) {
             renderer.fill_quad(
                 Quad {
                     bounds: Rectangle::new(

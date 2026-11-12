@@ -3,6 +3,8 @@ mod dmabuf;
 mod formats;
 mod gif;
 mod instance;
+mod notify;
+mod overlay;
 mod pixels;
 mod portal;
 mod region;
@@ -14,9 +16,10 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{ArgAction, Parser};
 
 use instance::{Instance, Role};
+use overlay::Overlay;
 use region::Region;
 
 /// Record a screen region to an animated GIF.
@@ -25,14 +28,15 @@ use region::Region;
 struct Args {
     /// Region to record, in screen coordinates: X,Y,WIDTH,HEIGHT.
     /// Shows a selection overlay if omitted.
-    #[arg(short, long, value_parser = parse_region)]
+    #[arg(short, long, value_parser = Region::parse)]
     region: Option<Region>,
 
     /// Frames per second.
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..=50))]
     fps: u32,
 
-    /// Stop after this many seconds (otherwise, stop with Ctrl+C).
+    /// Stop after this many seconds (otherwise, run the command again or
+    /// press Ctrl+C).
     #[arg(short, long)]
     duration: Option<f64>,
 
@@ -53,32 +57,20 @@ struct Args {
     #[arg(long)]
     no_dmabuf: bool,
 
+    /// Send a notification when the GIF is saved (or the recording fails).
+    /// Same syntax as cosmic-screenshot: `--notify=false` to disable.
+    #[arg(long,
+        default_missing_value("true"),
+        default_value("true"),
+        num_args(0..=1),
+        require_equals(true),
+        action = ArgAction::Set)]
+    notify: bool,
+
     /// Internal: only show the selection overlay, print the region on stdout
-    /// and exit. Used by the parent process, see `pick_region`.
+    /// and stay as a recording indicator. See `overlay.rs`.
     #[arg(long, hide = true)]
     select_only: bool,
-}
-
-/// Prefix of the line the child process prints, so the parent can't mistake
-/// a stray log line (from libcosmic or a driver) for the answer.
-const REGION_PREFIX: &str = "REGION ";
-
-/// Parses "X,Y,WIDTH,HEIGHT" into a `Region`. clap calls this for `--region`.
-fn parse_region(s: &str) -> Result<Region, String> {
-    let parts: Vec<u32> = s
-        .split(',')
-        .map(|p| p.trim().parse::<u32>())
-        .collect::<Result<_, _>>()
-        .map_err(|e| format!("invalid number: {e}"))?;
-    match parts[..] {
-        [x, y, width, height] if width > 0 && height > 0 => Ok(Region {
-            x,
-            y,
-            width,
-            height,
-        }),
-        _ => Err("expected X,Y,WIDTH,HEIGHT with WIDTH and HEIGHT > 0".into()),
-    }
 }
 
 /// Same convention as COSMIC screenshots (~/Pictures/Screenshots).
@@ -93,66 +85,25 @@ fn default_output() -> Result<PathBuf> {
     Ok(dir.join(format!("screencast_{now}.gif")))
 }
 
-/// Shows the selection overlay in a child process and returns the region.
-/// `None` means the user cancelled.
-///
-/// Why a separate process: when `cosmic::app::run()` returns, libcosmic's
-/// Wayland event-loop thread keeps running and later touches freed Wayland
-/// objects (use-after-free). It crashed the recording at random (glibc
-/// "tpp.c" assertion, SIGSEGV on focus change). When the child process exits,
-/// all of its threads, Wayland connection and GPU memory go away with it.
-async fn pick_region() -> Result<Option<Region>> {
-    let exe = std::env::current_exe().context("cannot find our own executable")?;
-    // stdout is captured (that's where the answer is); stderr is inherited so
-    // the child's errors still show in the terminal. `kill_on_drop`: if we
-    // stop waiting (selection cancelled by the shortcut), the overlay closes.
-    let output = tokio::process::Command::new(exe)
-        .arg("--select-only")
-        .stderr(std::process::Stdio::inherit())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .context("cannot start the selection overlay")?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // `find_map` returns the first line for which the closure returns `Some`.
-    let region = stdout
-        .lines()
-        .find_map(|line| line.strip_prefix(REGION_PREFIX))
-        .map(parse_region)
-        .transpose()
-        .map_err(|e| anyhow::anyhow!("overlay returned a bad region: {e}"))?;
-
-    // A region was printed: use it even if the child crashed while exiting.
-    if region.is_none() && !output.status.success() {
-        anyhow::bail!("selection overlay failed ({})", output.status);
-    }
-    Ok(region)
-}
-
-/// Child-process side of `pick_region`.
-fn run_selector_only() -> Result<()> {
-    if let Some(r) = selector::run()? {
-        println!("{REGION_PREFIX}{},{},{},{}", r.x, r.y, r.width, r.height);
-    }
-    // Leave right away: skipping the normal cleanup avoids racing with
-    // libcosmic's leftover thread (see `pick_region`).
-    use std::io::Write;
-    std::io::stdout().flush()?;
-    std::process::exit(0);
-}
-
 fn main() -> Result<()> {
     let args = Args::parse();
 
     if args.select_only {
-        return run_selector_only();
+        return overlay::run_child();
     }
 
     // `#[tokio::main]` is just a shortcut for these two lines. (The overlay
     // runs libcosmic, which has its own runtime: it stays in the child.)
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(run(args))
+    let notify = args.notify;
+    let result = runtime.block_on(run(args));
+    // Launched from a shortcut, nobody sees the terminal: report errors.
+    if let Err(error) = &result
+        && notify
+    {
+        runtime.block_on(notify::failed(error));
+    }
+    result
 }
 
 async fn run(args: Args) -> Result<()> {
@@ -165,26 +116,45 @@ async fn run(args: Args) -> Result<()> {
         }
     };
 
-    // 2. Pick the region, in a child process (see `pick_region`). Pressing
-    //    the shortcut again during the selection cancels it.
-    let region = match args.region {
-        Some(region) => Some(region),
+    // 2. Pick the region with the overlay (see `overlay.rs`). It stays on
+    //    screen during the recording. Pressing the shortcut again during the
+    //    selection cancels it.
+    let selected = match args.region {
+        Some(region) => Some((Some(region), None)),
         None => tokio::select! {
-            region = pick_region() => region?,
+            selected = overlay::select() => {
+                selected?.map(|(region, overlay)| (region, Some(overlay)))
+            }
             _ = instance.stop_requested() => None,
         },
     };
-    let Some(region) = region else {
+    let Some((region, overlay)) = selected else {
         println!("Cancelled.");
         return Ok(());
     };
-    println!("Region: {region:?}");
+    match region {
+        Some(region) => println!("Region: {region:?}"),
+        None => println!("Region: whole screen"),
+    }
 
     // 3. Record.
-    record(args, region, &instance).await
+    let notify = args.notify;
+    let output = record(args, region, overlay, &instance).await?;
+    if notify {
+        notify::saved(&output).await;
+    }
+    Ok(())
 }
 
-async fn record(args: Args, region: Region, instance: &Instance) -> Result<()> {
+/// Records `region` (`None` = the whole screen) until stopped, and returns
+/// the path of the saved GIF. `overlay` (if any) is closed as soon as the
+/// capture stops.
+async fn record(
+    args: Args,
+    region: Option<Region>,
+    overlay: Option<Overlay>,
+    instance: &Instance,
+) -> Result<PathBuf> {
     let output = match args.output {
         Some(path) => path,
         None => default_output()?,
@@ -235,7 +205,7 @@ async fn record(args: Args, region: Region, instance: &Instance) -> Result<()> {
             // dedicated thread so it doesn't block tokio's async runtime.
             let (stop_tx, stop_rx) = pipewire::channel::channel::<()>();
             let options = capture::Options {
-                region: Some(region),
+                region,
                 logical_size: stream.size,
                 fps: args.fps,
                 dmabuf,
@@ -271,6 +241,9 @@ async fn record(args: Args, region: Region, instance: &Instance) -> Result<()> {
     }
     .await;
 
+    // The capture is over: remove the overlay right away, before encoding.
+    drop(overlay);
+
     // Every capture thread has dropped its sender; drop ours too, so the
     // encoder sees the end of the frames.
     drop(frame_tx);
@@ -289,31 +262,5 @@ async fn record(args: Args, region: Region, instance: &Instance) -> Result<()> {
         output.display(),
         size as f64 / 1_000_000.0
     );
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_a_region() {
-        assert_eq!(
-            parse_region("10, 20,300,200"),
-            Ok(Region {
-                x: 10,
-                y: 20,
-                width: 300,
-                height: 200
-            })
-        );
-    }
-
-    #[test]
-    fn rejects_bad_regions() {
-        assert!(parse_region("10,20,300").is_err()); // 3 numbers
-        assert!(parse_region("10,20,0,200").is_err()); // zero width
-        assert!(parse_region("10,-20,300,200").is_err()); // negative
-        assert!(parse_region("a,b,c,d").is_err());
-    }
+    Ok(output)
 }
