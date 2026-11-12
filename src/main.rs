@@ -41,7 +41,16 @@ struct Args {
     /// Output file. Defaults to ~/Videos/Screencasts/screencast_<date>.gif.
     #[arg(short, long)]
     output: Option<PathBuf>,
+
+    /// Internal: only show the selection overlay, print the region on stdout
+    /// and exit. Used by the parent process, see `pick_region`.
+    #[arg(long, hide = true)]
+    select_only: bool,
 }
+
+/// Prefix of the line the child process prints, so the parent can't mistake
+/// a stray log line (from libcosmic or a driver) for the answer.
+const REGION_PREFIX: &str = "REGION ";
 
 /// Parses "X,Y,WIDTH,HEIGHT" into a `Region`. clap calls this for `--region`.
 fn parse_region(s: &str) -> Result<Region, String> {
@@ -73,14 +82,63 @@ fn default_output() -> Result<PathBuf> {
     Ok(dir.join(format!("screencast_{now}.gif")))
 }
 
+/// Shows the selection overlay in a child process and returns the region.
+/// `None` means the user cancelled.
+///
+/// Why a separate process: when `cosmic::app::run()` returns, libcosmic's
+/// Wayland event-loop thread keeps running and later touches freed Wayland
+/// objects (use-after-free). It crashed the recording at random (glibc
+/// "tpp.c" assertion, SIGSEGV on focus change). When the child process exits,
+/// all of its threads, Wayland connection and GPU memory go away with it.
+fn pick_region() -> Result<Option<Region>> {
+    let exe = std::env::current_exe().context("cannot find our own executable")?;
+    // stdout is captured (that's where the answer is); stderr is inherited so
+    // the child's errors still show in the terminal.
+    let output = std::process::Command::new(exe)
+        .arg("--select-only")
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .context("cannot start the selection overlay")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // `find_map` returns the first line for which the closure returns `Some`.
+    let region = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(REGION_PREFIX))
+        .map(parse_region)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("overlay returned a bad region: {e}"))?;
+
+    // A region was printed: use it even if the child crashed while exiting.
+    if region.is_none() && !output.status.success() {
+        anyhow::bail!("selection overlay failed ({})", output.status);
+    }
+    Ok(region)
+}
+
+/// Child-process side of `pick_region`.
+fn run_selector_only() -> Result<()> {
+    if let Some(r) = selector::run()? {
+        println!("{REGION_PREFIX}{},{},{},{}", r.x, r.y, r.width, r.height);
+    }
+    // Leave right away: skipping the normal cleanup avoids racing with
+    // libcosmic's leftover thread (see `pick_region`).
+    use std::io::Write;
+    std::io::stdout().flush()?;
+    std::process::exit(0);
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // 1. Pick the region. The overlay (libcosmic) runs its own event loop and
-    //    async runtime, so it must run *before* we start ours.
+    if args.select_only {
+        return run_selector_only();
+    }
+
+    // 1. Pick the region, in a child process (see `pick_region`).
     let region = match args.region {
         Some(region) => region,
-        None => match selector::run()? {
+        None => match pick_region()? {
             Some(region) => region,
             None => {
                 println!("Cancelled.");

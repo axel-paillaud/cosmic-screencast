@@ -12,7 +12,8 @@ Code, comments, console messages and docs are in English.
 ## Architecture
 
 ```
-main.rs      CLI (clap). Runs the selector, then builds a tokio runtime and records.
+main.rs      CLI (clap). Runs the selector in a child process (`--select-only`),
+             then builds a tokio runtime and records.
 selector.rs  libcosmic app, no main window: one fullscreen transparent layer-shell
              surface (Layer::Overlay, active output). Returns the region via a channel.
 selection.rs Custom iced widget: draw / move / resize a rectangle. Look copied from
@@ -43,8 +44,12 @@ Flow: overlay → portal → PipeWire capture ⇄ channel ⇄ gifski → `~/Vide
   using the portal's logical size (HiDPI not yet tested).
 - Capture never blocks: `try_send` on a bounded channel, frames dropped if the encoder lags.
 - On stop, the last frame is re-added at stop time so a static ending stays visible.
-- The libcosmic overlay runs its own event loop/runtime: it must run **before** the
-  tokio runtime is created (hence no `#[tokio::main]`).
+- **The overlay runs in a child process** (same binary, hidden `--select-only` flag,
+  prints `REGION x,y,w,h` on stdout). After `cosmic::app::run()` returns, libcosmic's
+  Wayland event-loop thread (`SctkEventLoop`) keeps running and touches freed Wayland
+  objects: random crashes during recording (glibc `tpp.c` assertion in
+  `wl_display_cancel_read`, SIGSEGV on focus change). Do not run libcosmic in the
+  recording process.
 - libcosmic is a git dependency pinned to a `rev`. First build is long (15+ min on a
   low-end machine); dependencies are built with `opt-level = 3` even in debug.
 - `cargo clippy` / `cargo check` do **not** rebuild the binary: run `cargo build`
