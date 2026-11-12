@@ -3,8 +3,18 @@
 //! PipeWire is built around an event loop (`MainLoop`): we register callbacks,
 //! then run the loop, which calls them when something happens (new format,
 //! new frame...).
+//!
+//! # Pacing (why we hold buffers)
+//!
+//! The portal copies the screen into a buffer only when we give one back to
+//! it, and it ignores any framerate we ask for. If we hand buffers back right
+//! away, the compositor copies the whole screen (GPU → RAM) at refresh rate,
+//! which makes the desktop and the mouse stutter. So we keep every buffer we
+//! receive, and a timer gives one back every 1/fps second: the compositor
+//! never copies more than `fps` frames per second.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
 use std::sync::mpsc::{SyncSender, TrySendError};
@@ -15,6 +25,7 @@ use imgref::ImgVec;
 use pipewire as pw;
 use pw::properties::properties;
 use pw::spa;
+use pw::sys::pw_buffer;
 use rgb::RGBA8;
 use spa::param::video::{VideoFormat, VideoInfoRaw};
 use spa::pod::Pod;
@@ -60,7 +71,13 @@ struct State {
     frames: SyncSender<Frame>,
     stats: Rc<Stats>,
     last_kept: Option<Instant>,
+    held: HeldBuffers,
 }
+
+/// Buffers we keep from the portal, oldest first (see "Pacing" above).
+/// Raw pointers: they belong to the stream, we only borrow them until we
+/// queue them back. Shared by the `process` callback and the timer.
+type HeldBuffers = Rc<RefCell<VecDeque<*mut pw_buffer>>>;
 
 /// Runs the capture. This function blocks until a message arrives on `stop`.
 /// Every kept frame is sent to `frames`; the channel closes when we return.
@@ -84,8 +101,10 @@ pub fn run(
     let loop_for_stop = mainloop.clone();
     let _stop = stop.attach(mainloop.loop_(), move |()| loop_for_stop.quit());
 
-    let stream = pw::stream::StreamBox::new(
-        &core,
+    // `StreamRc` (not `StreamBox`): the timer below needs its own handle on
+    // the stream.
+    let stream = pw::stream::StreamRc::new(
+        core.clone(),
         "cosmic-screencast",
         properties! {
             *pw::keys::MEDIA_TYPE => "Video",
@@ -97,12 +116,14 @@ pub fn run(
     // Copy it now: `options` is moved into `state` just below.
     let state_fps = options.fps.max(1);
     let stats = Rc::new(Stats::default());
+    let held = HeldBuffers::default();
     let state = State {
         format: Default::default(),
         options,
         frames,
         stats: stats.clone(),
         last_kept: None,
+        held: held.clone(),
     };
 
     let _listener = stream
@@ -129,24 +150,35 @@ pub fn run(
                 );
             }
         })
+        .remove_buffer(|_, state, buffer| {
+            // The stream is freeing this buffer (e.g. format change): forget
+            // it, or the timer would queue a dangling pointer.
+            state.held.borrow_mut().retain(|&held| held != buffer);
+        })
         .process(|stream, state| {
-            let Some(mut buffer) = stream.dequeue_buffer() else {
+            // SAFETY: the buffer is given back to the stream by the timer, or
+            // after the loop ends. Never used after that.
+            let buffer = unsafe { stream.dequeue_raw_buffer() };
+            if buffer.is_null() {
                 return;
-            };
+            }
+            // Keep it: the compositor can't copy a new frame into it until
+            // the timer gives it back. This is what keeps the desktop smooth.
+            state.held.borrow_mut().push_back(buffer);
             state.stats.received.set(state.stats.received.get() + 1);
 
-            // Skip frames that arrive too soon: this is what keeps
-            // CPU usage low.
+            // The pacing above already limits the rate. This only absorbs
+            // the burst at startup, when the portal fills all its buffers.
             let now = Instant::now();
             let interval = Duration::from_secs_f64(1.0 / state.options.fps as f64);
             if let Some(last) = state.last_kept
-                && now.duration_since(last) < interval
+                && now.duration_since(last) < interval / 2
             {
                 return;
             }
 
-            let datas = buffer.datas_mut();
-            let Some(data) = datas.first_mut() else {
+            // SAFETY: we hold the buffer (see above).
+            let Some(data) = (unsafe { first_data(buffer) }) else {
                 return;
             };
             let stride = data.chunk().stride() as usize;
@@ -181,8 +213,7 @@ pub fn run(
 
     // Tell PipeWire which formats we can read. We only offer simple 32-bit
     // formats, in shared memory (no DMA-BUF for now).
-    // Note: COSMIC ignores our preferred framerate and sends frames at screen
-    // refresh rate when the screen changes; we skip the extra ones ourselves.
+    // Note: COSMIC ignores our preferred framerate (see "Pacing" at the top).
     let fps = state_fps;
     let format_pod = spa::pod::object!(
         spa::utils::SpaTypes::ObjectParamFormat,
@@ -254,8 +285,31 @@ pub fn run(
         &mut params,
     )?;
 
+    // Every 1/fps second, give the oldest held buffer back to the portal,
+    // allowing the compositor to copy one new frame.
+    let timer_stream = stream.clone();
+    let timer_held = held.clone();
+    let timer = mainloop.loop_().add_timer(move |_expirations| {
+        // Take it out first, so the `RefCell` is not borrowed while
+        // PipeWire runs (it could call our callbacks).
+        let next = timer_held.borrow_mut().pop_front();
+        if let Some(buffer) = next {
+            // SAFETY: dequeued from this stream, and no longer held.
+            unsafe { timer_stream.queue_raw_buffer(buffer) };
+        }
+    });
+    let tick = Duration::from_secs_f64(1.0 / fps as f64);
+    timer.update_timer(Some(tick), Some(tick)).into_result()?;
+
     println!("Recording... press Ctrl+C to stop.");
     mainloop.run();
+
+    // Give everything back before the stream is destroyed.
+    let remaining: Vec<_> = held.borrow_mut().drain(..).collect();
+    for buffer in remaining {
+        // SAFETY: same as in the timer.
+        unsafe { stream.queue_raw_buffer(buffer) };
+    }
 
     println!(
         "Received {} frames from the compositor, dropped {} (encoder too slow).",
@@ -263,6 +317,23 @@ pub fn run(
         stats.dropped.get()
     );
     Ok(())
+}
+
+/// Returns the first data block (the pixels) of a raw PipeWire buffer.
+///
+/// # Safety
+///
+/// `buffer` must come from `dequeue_raw_buffer` and not be queued back yet.
+unsafe fn first_data<'a>(buffer: *mut pw_buffer) -> Option<&'a mut spa::buffer::Data> {
+    // SAFETY: guaranteed by the caller; `Data` is a transparent wrapper
+    // around `spa_data`, so the pointer cast is valid.
+    unsafe {
+        let spa_buffer = (*buffer).buffer;
+        if spa_buffer.is_null() || (*spa_buffer).n_datas == 0 {
+            return None;
+        }
+        ((*spa_buffer).datas as *mut spa::buffer::Data).as_mut()
+    }
 }
 
 /// Crops the raw buffer to the requested region and converts it to RGBA.

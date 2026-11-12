@@ -36,8 +36,14 @@ Flow: overlay → portal → PipeWire capture ⇄ channel ⇄ gifski → `~/Vide
   close it at the end.
 - **Do not constrain framerate in the PipeWire format pod.** COSMIC imposes its own
   max-framerate; a narrower range makes negotiation fail silently
-  (`Error("no more output formats")`, 0 frames). COSMIC sends ~40 fps when the screen
-  changes, nothing when static; we skip extra frames ourselves.
+  (`Error("no more output formats")`, 0 frames). The portal ignores framerate requests
+  (`// TODO max framerate` in xdg-desktop-portal-cosmic).
+- **Pacing by holding buffers.** The portal copies a frame (full screen, GPU → RAM for
+  SHM) only into buffers we give back. Returning them immediately = compositor copies
+  at refresh rate whenever the screen changes = laggy mouse. `capture.rs` keeps every
+  dequeued buffer (raw `pw_buffer` pointers) and a loop timer queues one back every
+  1/fps s. Held buffers must be dropped in `remove_buffer` and queued back before the
+  stream is destroyed.
 - Frames are **SHM only** (no DMA-BUF modifiers offered), formats BGRx/BGRA/RGBx/RGBA.
   Respect `chunk().stride()`.
 - Region is in **logical** coordinates; frames are physical pixels. `capture.rs` scales
