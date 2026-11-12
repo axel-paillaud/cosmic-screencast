@@ -16,7 +16,7 @@ use cosmic::iced::runtime::platform_specific::wayland::layer_surface::{
 use cosmic::iced::{Alignment, Color, Event, Length, Rectangle, Subscription, event, window};
 use cosmic::widget::{Row, button, container, text};
 
-use crate::capture::Region;
+use crate::region::Region;
 use crate::selection::Selection;
 
 /// Shows the overlay and blocks until the user confirms or cancels.

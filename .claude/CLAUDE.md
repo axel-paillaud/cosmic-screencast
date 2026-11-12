@@ -20,8 +20,11 @@ selection.rs Custom iced widget: draw / move / resize a rectangle. Look copied f
              the screenshot portal (30% black dim, 4px accent border, corner handles).
 portal.rs    XDG ScreenCast portal (ashpd): gets a PipeWire fd + node id.
 capture.rs   PipeWire stream (own thread), paced by holding buffers (≤ --fps frames/s),
-             crops to the region, converts to RGBA, sends frames on a bounded channel.
+             reads each frame (DMA-BUF or SHM), sends it on a bounded channel.
+formats.rs   Format pods offered to PipeWire (DMA-BUF LINEAR first, then SHM).
 dmabuf.rs    Maps a DMA-BUF (GPU memory) for CPU reads.
+region.rs    `Region` + logical → physical pixels conversion (HiDPI, clamping).
+pixels.rs    Crop a raw frame + convert BGR/RGB to RGBA.
 gif.rs       gifski encoder thread, encodes while recording.
 ```
 
@@ -51,6 +54,10 @@ Flow: overlay → portal → PipeWire capture ⇄ channel ⇄ gifski → `~/Vide
   `DMA_BUF_IOCTL_SYNC` and we read only the selected rows. GPU memory is uncached:
   copy whole rows (`copy_from_slice`), never read pixel by pixel (was ~10× slower).
   `--no-dmabuf` forces SHM. Respect `chunk().stride()` / `offset()`.
+- **Runtime fallback = new portal session.** If a DMA-BUF can't be mapped, `capture::run`
+  returns `Outcome::DmabufUnreadable` and `main.rs` reopens the portal with SHM only.
+  Renegotiating in the same stream does NOT work: the portal keeps its modifier and
+  either keeps sending DMA-BUFs or fails with `error alloc buffers: Invalid argument`.
 - Region is in **logical** coordinates; frames are physical pixels. `capture.rs` scales
   using the portal's logical size (HiDPI not yet tested).
 - Capture never blocks: `try_send` on a bounded channel, frames dropped if the encoder lags.
@@ -70,7 +77,9 @@ Flow: overlay → portal → PipeWire capture ⇄ channel ⇄ gifski → `~/Vide
 
 ## Checks before handing over
 
-`cargo fmt && cargo clippy && cargo build`
+`cargo fmt && cargo clippy --all-targets && cargo test && cargo build`
+
+Unit tests cover the pure functions (`region.rs`, `pixels.rs`, `parse_region`).
 
 ## Roadmap
 

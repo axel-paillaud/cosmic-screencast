@@ -1,7 +1,10 @@
 mod capture;
 mod dmabuf;
+mod formats;
 mod gif;
+mod pixels;
 mod portal;
+mod region;
 mod selection;
 mod selector;
 
@@ -12,7 +15,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use capture::Region;
+use region::Region;
 
 /// Record a screen region to an animated GIF.
 #[derive(Parser)]
@@ -24,7 +27,7 @@ struct Args {
     region: Option<Region>,
 
     /// Frames per second.
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..=50))]
     fps: u32,
 
     /// Stop after this many seconds (otherwise, stop with Ctrl+C).
@@ -165,12 +168,8 @@ async fn record(args: Args, region: Region) -> Result<()> {
         None => default_output()?,
     };
 
-    // Ask the portal for screen access (async: goes through D-Bus).
-    let stream = portal::open().await?;
-    println!("Screen logical size: {:?}", stream.size);
-
     // Start the encoder. The channel is bounded: a few frames of buffer
-    //    between capture and encoding.
+    // between capture and encoding.
     let (frame_tx, frame_rx) = mpsc::sync_channel(8);
     let encoder = gif::spawn(
         frame_rx,
@@ -181,49 +180,84 @@ async fn record(args: Args, region: Region) -> Result<()> {
         },
     );
 
-    // Start the capture. The PipeWire loop is blocking: run it on a
-    //    dedicated thread so it doesn't block tokio's async runtime.
-    let (stop_tx, stop_rx) = pipewire::channel::channel::<()>();
-    let options = capture::Options {
-        region: Some(region),
-        logical_size: stream.size,
-        fps: args.fps.max(1),
-        dmabuf: !args.no_dmabuf,
-    };
-    // `fd` is moved into the thread, but `stream` itself stays here so the
-    // portal session lives until the end.
-    let (node_id, fd) = (stream.node_id, stream.fd.try_clone()?);
-    let mut capture =
-        tokio::task::spawn_blocking(move || capture::run(node_id, fd, options, frame_tx, stop_rx));
-
-    // Wait for Ctrl+C, the duration, or the capture ending by itself.
-    let timeout = async {
-        match args.duration {
-            Some(secs) => tokio::time::sleep(Duration::from_secs_f64(secs)).await,
-            None => std::future::pending().await,
+    // What stops the recording: Ctrl+C or the duration. Created once and
+    // "pinned" so the loop below can wait on it several times.
+    let stop_requested = async {
+        let timeout = async {
+            match args.duration {
+                Some(secs) => tokio::time::sleep(Duration::from_secs_f64(secs)).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => println!("\nStopping..."),
+            _ = timeout => println!("Duration reached, stopping..."),
         }
     };
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => println!("\nStopping..."),
-        _ = timeout => println!("Duration reached, stopping..."),
-        result = &mut capture => {
-            // The capture ended without being asked to: report why.
-            result??;
-        }
-    }
-    // If the capture already ended, nobody listens anymore: ignore the error.
-    let _ = stop_tx.send(());
-    if !capture.is_finished() {
-        capture.await??;
-    }
-    stream.close().await?;
+    tokio::pin!(stop_requested);
 
-    // The capture thread has dropped its sender: the encoder finishes.
-    println!("Encoding GIF...");
-    encoder
+    // The capture itself; in a block so that, even on error, we stop the
+    // encoder properly below (it deletes its unfinished file).
+    let captured: Result<()> = async {
+        // Usually runs once. If GPU memory can't be read, run again with
+        // shared memory: this needs a new portal session (see `capture.rs`).
+        let mut dmabuf = !args.no_dmabuf;
+        loop {
+            // Ask the portal for screen access (async: goes through D-Bus).
+            let stream = portal::open().await?;
+            println!("Screen logical size: {:?}", stream.size);
+
+            // Start the capture. The PipeWire loop is blocking: run it on a
+            // dedicated thread so it doesn't block tokio's async runtime.
+            let (stop_tx, stop_rx) = pipewire::channel::channel::<()>();
+            let options = capture::Options {
+                region: Some(region),
+                logical_size: stream.size,
+                fps: args.fps,
+                dmabuf,
+            };
+            // `fd` is moved into the thread, but `stream` itself stays here so
+            // the portal session lives until the end.
+            let (node_id, fd) = (stream.node_id, stream.fd.try_clone()?);
+            let frames = frame_tx.clone();
+            let mut capture = tokio::task::spawn_blocking(move || {
+                capture::run(node_id, fd, options, frames, stop_rx)
+            });
+
+            // Wait for a stop request, or the capture ending by itself.
+            let (outcome, stop) = tokio::select! {
+                _ = &mut stop_requested => {
+                    // If the capture already ended, nobody listens: ignore errors.
+                    let _ = stop_tx.send(());
+                    (capture.await??, true)
+                }
+                result = &mut capture => (result??, false),
+            };
+            stream.close().await?;
+
+            match outcome {
+                capture::Outcome::DmabufUnreadable if !stop => {
+                    println!("Starting again with shared memory...");
+                    dmabuf = false;
+                }
+                _ => break,
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    // Every capture thread has dropped its sender; drop ours too, so the
+    // encoder sees the end of the frames.
+    drop(frame_tx);
+    if captured.is_ok() {
+        println!("Encoding GIF...");
+    }
+    let encoded = encoder
         .join()
-        .map_err(|_| anyhow::anyhow!("encoder thread panicked"))?
-        .context("GIF encoding failed")?;
+        .map_err(|_| anyhow::anyhow!("encoder thread panicked"))?;
+    captured?;
+    encoded.context("GIF encoding failed")?;
 
     let size = std::fs::metadata(&output)?.len();
     println!(
@@ -232,4 +266,30 @@ async fn record(args: Args, region: Region) -> Result<()> {
         size as f64 / 1_000_000.0
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_region() {
+        assert_eq!(
+            parse_region("10, 20,300,200"),
+            Ok(Region {
+                x: 10,
+                y: 20,
+                width: 300,
+                height: 200
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_bad_regions() {
+        assert!(parse_region("10,20,300").is_err()); // 3 numbers
+        assert!(parse_region("10,20,0,200").is_err()); // zero width
+        assert!(parse_region("10,-20,300,200").is_err()); // negative
+        assert!(parse_region("a,b,c,d").is_err());
+    }
 }
