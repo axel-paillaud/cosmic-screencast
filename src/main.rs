@@ -2,6 +2,7 @@ mod capture;
 mod dmabuf;
 mod formats;
 mod gif;
+mod instance;
 mod pixels;
 mod portal;
 mod region;
@@ -15,6 +16,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 
+use instance::{Instance, Role};
 use region::Region;
 
 /// Record a screen region to an animated GIF.
@@ -99,14 +101,17 @@ fn default_output() -> Result<PathBuf> {
 /// objects (use-after-free). It crashed the recording at random (glibc
 /// "tpp.c" assertion, SIGSEGV on focus change). When the child process exits,
 /// all of its threads, Wayland connection and GPU memory go away with it.
-fn pick_region() -> Result<Option<Region>> {
+async fn pick_region() -> Result<Option<Region>> {
     let exe = std::env::current_exe().context("cannot find our own executable")?;
     // stdout is captured (that's where the answer is); stderr is inherited so
-    // the child's errors still show in the terminal.
-    let output = std::process::Command::new(exe)
+    // the child's errors still show in the terminal. `kill_on_drop`: if we
+    // stop waiting (selection cancelled by the shortcut), the overlay closes.
+    let output = tokio::process::Command::new(exe)
         .arg("--select-only")
         .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true)
         .output()
+        .await
         .context("cannot start the selection overlay")?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -144,25 +149,42 @@ fn main() -> Result<()> {
         return run_selector_only();
     }
 
-    // 1. Pick the region, in a child process (see `pick_region`).
+    // `#[tokio::main]` is just a shortcut for these two lines. (The overlay
+    // runs libcosmic, which has its own runtime: it stays in the child.)
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(run(args))
+}
+
+async fn run(args: Args) -> Result<()> {
+    // 1. Already recording? Then this launch means "stop" (see `instance.rs`).
+    let instance = match instance::claim().await? {
+        Role::Recorder(instance) => instance,
+        Role::StopSent => {
+            println!("Stopped the recording in progress.");
+            return Ok(());
+        }
+    };
+
+    // 2. Pick the region, in a child process (see `pick_region`). Pressing
+    //    the shortcut again during the selection cancels it.
     let region = match args.region {
-        Some(region) => region,
-        None => match pick_region()? {
-            Some(region) => region,
-            None => {
-                println!("Cancelled.");
-                return Ok(());
-            }
+        Some(region) => Some(region),
+        None => tokio::select! {
+            region = pick_region() => region?,
+            _ = instance.stop_requested() => None,
         },
+    };
+    let Some(region) = region else {
+        println!("Cancelled.");
+        return Ok(());
     };
     println!("Region: {region:?}");
 
-    // 2. Record. `#[tokio::main]` is just a shortcut for these two lines.
-    let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(record(args, region))
+    // 3. Record.
+    record(args, region, &instance).await
 }
 
-async fn record(args: Args, region: Region) -> Result<()> {
+async fn record(args: Args, region: Region, instance: &Instance) -> Result<()> {
     let output = match args.output {
         Some(path) => path,
         None => default_output()?,
@@ -180,7 +202,8 @@ async fn record(args: Args, region: Region) -> Result<()> {
         },
     );
 
-    // What stops the recording: Ctrl+C or the duration. Created once and
+    // What stops the recording: Ctrl+C, the shortcut (another launch, see
+    // `instance.rs`) or the duration. Created once and
     // "pinned" so the loop below can wait on it several times.
     let stop_requested = async {
         let timeout = async {
@@ -191,6 +214,7 @@ async fn record(args: Args, region: Region) -> Result<()> {
         };
         tokio::select! {
             _ = tokio::signal::ctrl_c() => println!("\nStopping..."),
+            _ = instance.stop_requested() => println!("Stop requested, stopping..."),
             _ = timeout => println!("Duration reached, stopping..."),
         }
     };

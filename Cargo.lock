@@ -1220,6 +1220,7 @@ dependencies = [
  "pipewire",
  "rgb",
  "tokio",
+ "zbus 6.2.1",
 ]
 
 [[package]]

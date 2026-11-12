@@ -207,7 +207,7 @@ pub fn run(
     });
     timer.update_timer(Some(tick), Some(tick)).into_result()?;
 
-    println!("Recording... press Ctrl+C to stop.");
+    println!("Recording... run the command again (or press Ctrl+C) to stop.");
     mainloop.run();
 
     // Give everything back before the stream is destroyed.

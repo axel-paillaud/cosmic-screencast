@@ -12,8 +12,9 @@ Code, comments, console messages and docs are in English.
 ## Architecture
 
 ```
-main.rs      CLI (clap). Runs the selector in a child process (`--select-only`),
-             then builds a tokio runtime and records.
+main.rs      CLI (clap). Claims the single instance, runs the selector in a child
+             process (`--select-only`), then records (tokio).
+instance.rs  Single instance over D-Bus: a second launch calls `Stop` on the first.
 selector.rs  libcosmic app, no main window: one fullscreen transparent layer-shell
              surface (Layer::Overlay, active output). Returns the region via a channel.
 selection.rs Custom iced widget: draw / move / resize a rectangle. Look copied from
@@ -62,6 +63,13 @@ Flow: overlay → portal → PipeWire capture ⇄ channel ⇄ gifski → `~/Vide
   using the portal's logical size (HiDPI not yet tested).
 - Capture never blocks: `try_send` on a bounded channel, frames dropped if the encoder lags.
 - On stop, the last frame is re-added at stop time so a static ending stays visible.
+- **Start/stop toggle.** Meant to be bound to one shortcut (COSMIC Settings > Keyboard >
+  Custom shortcuts, e.g. Ctrl+Print → absolute path of the binary). First launch owns
+  `com.github.cosmic_screencast` on the session bus and serves
+  `com.github.cosmic_screencast.Control.Stop`; a second launch calls it and exits.
+  Request the name with `DO_NOT_QUEUE` only (zbus defaults include REPLACE_EXISTING),
+  and "taken" comes back as `Err(zbus::Error::NameTaken)`, not as a reply.
+  Stop during the selection cancels it (the overlay child is `kill_on_drop`).
 - **The overlay runs in a child process** (same binary, hidden `--select-only` flag,
   prints `REGION x,y,w,h` on stdout). After `cosmic::app::run()` returns, libcosmic's
   Wayland event-loop thread (`SctkEventLoop`) keeps running and touches freed Wayland
@@ -83,14 +91,16 @@ Unit tests cover the pure functions (`region.rs`, `pixels.rs`, `parse_region`).
 
 ## Roadmap
 
-Done: 1. PipeWire capture · 2. crop + GIF · 3. selection overlay.
+Done: 1. PipeWire capture · 2. crop + GIF · 3. selection overlay · 4. pacing + DMA-BUF
+· 5. start/stop with the same command (shortcut).
 
 Next:
-- Turn it into a COSMIC panel applet (libcosmic `applet` feature): start / stop
-  recording from the panel. This changes the app structure (long-running process).
 - Keep the selection rectangle visible during recording (overlay must not be
   captured / must not take input).
-- A way to stop recording without a terminal (panel icon, shortcut, notification...).
+- Feedback without a terminal: desktop notification when the GIF is saved (D-Bus
+  `org.freedesktop.Notifications`), maybe one when recording starts.
+- Install the default shortcut (Ctrl+Print) at install time. Panel applet: decided
+  not needed for now (cosmic-screenshot has none; demos are short).
 - Optional MP4 output.
 - Multi-monitor: overlay is on the active output, capture is on the portal-remembered
   monitor; they must match.
