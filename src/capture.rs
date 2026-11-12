@@ -15,7 +15,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::os::fd::OwnedFd;
+use std::os::fd::{OwnedFd, RawFd};
 use std::rc::Rc;
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::time::{Duration, Instant};
@@ -27,6 +27,8 @@ use pw::properties::properties;
 use pw::spa;
 use pw::sys::pw_buffer;
 use rgb::RGBA8;
+
+use crate::dmabuf;
 use spa::param::video::{VideoFormat, VideoInfoRaw};
 use spa::pod::Pod;
 
@@ -54,6 +56,8 @@ pub struct Options {
     pub logical_size: Option<(i32, i32)>,
     /// Frames per second we want to keep.
     pub fps: u32,
+    /// Offer DMA-BUF (GPU memory) first. If false, shared memory only.
+    pub dmabuf: bool,
 }
 
 /// Counters we want to read after the loop ends. `Cell` allows mutation
@@ -71,6 +75,8 @@ struct State {
     frames: SyncSender<Frame>,
     stats: Rc<Stats>,
     last_kept: Option<Instant>,
+    /// Whether we printed the buffer type yet.
+    announced: bool,
     held: HeldBuffers,
 }
 
@@ -115,6 +121,7 @@ pub fn run(
 
     // Copy it now: `options` is moved into `state` just below.
     let state_fps = options.fps.max(1);
+    let use_dmabuf = options.dmabuf;
     let stats = Rc::new(Stats::default());
     let held = HeldBuffers::default();
     let state = State {
@@ -123,6 +130,7 @@ pub fn run(
         frames,
         stats: stats.clone(),
         last_kept: None,
+        announced: false,
         held: held.clone(),
     };
 
@@ -188,11 +196,42 @@ pub fn run(
                 // Empty frame: the compositor is just saying "nothing changed".
                 return;
             }
-            let Some(bytes) = data.data() else {
-                eprintln!("Buffer is not mapped in memory (DMA-BUF?)");
+
+            // Two kinds of buffers, see `format_pods`.
+            let is_dmabuf = data.type_() == spa::buffer::DataType::DmaBuf;
+            if !state.announced {
+                state.announced = true;
+                println!(
+                    "Buffers: {}",
+                    if is_dmabuf {
+                        "DMA-BUF (GPU memory)"
+                    } else {
+                        "shared memory (CPU)"
+                    }
+                );
+            }
+            // `mapping` must live while we read `bytes`: declared out here.
+            let mapping;
+            let bytes = if is_dmabuf {
+                mapping = match dmabuf::Mapping::new(data.fd() as RawFd, offset + size) {
+                    Ok(mapping) => mapping,
+                    Err(e) => {
+                        eprintln!("Cannot read the DMA-BUF: {e} (try --no-dmabuf)");
+                        return;
+                    }
+                };
+                mapping.bytes()
+            } else {
+                let Some(bytes) = data.data() else {
+                    eprintln!("Buffer is not mapped in memory");
+                    return;
+                };
+                bytes
+            };
+            let Some(bytes) = bytes.get(offset..offset + size) else {
+                eprintln!("Buffer is smaller than announced");
                 return;
             };
-            let bytes = &bytes[offset..offset + size];
 
             let Some(image) = crop_to_rgba(bytes, stride, &state.format, &state.options) else {
                 eprintln!("Unsupported pixel format: {:?}", state.format.format());
@@ -211,72 +250,13 @@ pub fn run(
         })
         .register()?;
 
-    // Tell PipeWire which formats we can read. We only offer simple 32-bit
-    // formats, in shared memory (no DMA-BUF for now).
-    // Note: COSMIC ignores our preferred framerate (see "Pacing" at the top).
+    // Tell PipeWire which formats we can read, in order of preference.
     let fps = state_fps;
-    let format_pod = spa::pod::object!(
-        spa::utils::SpaTypes::ObjectParamFormat,
-        spa::param::ParamType::EnumFormat,
-        spa::pod::property!(
-            spa::param::format::FormatProperties::MediaType,
-            Id,
-            spa::param::format::MediaType::Video
-        ),
-        spa::pod::property!(
-            spa::param::format::FormatProperties::MediaSubtype,
-            Id,
-            spa::param::format::MediaSubtype::Raw
-        ),
-        spa::pod::property!(
-            spa::param::format::FormatProperties::VideoFormat,
-            Choice,
-            Enum,
-            Id,
-            VideoFormat::BGRx,
-            VideoFormat::BGRx,
-            VideoFormat::BGRA,
-            VideoFormat::RGBx,
-            VideoFormat::RGBA,
-        ),
-        spa::pod::property!(
-            spa::param::format::FormatProperties::VideoSize,
-            Choice,
-            Range,
-            Rectangle,
-            spa::utils::Rectangle {
-                width: 1920,
-                height: 1080
-            },
-            spa::utils::Rectangle {
-                width: 1,
-                height: 1
-            },
-            spa::utils::Rectangle {
-                width: 8192,
-                height: 8192
-            }
-        ),
-        spa::pod::property!(
-            spa::param::format::FormatProperties::VideoFramerate,
-            Choice,
-            Range,
-            Fraction,
-            spa::utils::Fraction { num: fps, denom: 1 },
-            spa::utils::Fraction { num: 0, denom: 1 },
-            spa::utils::Fraction {
-                num: 1000,
-                denom: 1
-            }
-        ),
-    );
-    let bytes: Vec<u8> = spa::pod::serialize::PodSerializer::serialize(
-        std::io::Cursor::new(Vec::new()),
-        &spa::pod::Value::Object(format_pod),
-    )?
-    .0
-    .into_inner();
-    let mut params = [Pod::from_bytes(&bytes).expect("valid pod")];
+    let pods = format_pods(fps, use_dmabuf)?;
+    let mut params: Vec<&Pod> = pods
+        .iter()
+        .map(|bytes| Pod::from_bytes(bytes).expect("valid pod"))
+        .collect();
 
     stream.connect(
         spa::utils::Direction::Input,
@@ -317,6 +297,105 @@ pub fn run(
         stats.dropped.get()
     );
     Ok(())
+}
+
+/// The formats we accept, as serialized "pods" (PipeWire's binary format).
+///
+/// 1. DMA-BUF, LINEAR layout: the compositor copies the screen GPU → GPU
+///    (cheap), we read only the selected rows (see `dmabuf.rs`).
+/// 2. Shared memory: the compositor copies the whole screen to RAM, which
+///    stalls it a bit. Fallback when DMA-BUF isn't possible (software
+///    rendering, LINEAR not supported...). PipeWire picks the first match.
+///
+/// Note: COSMIC ignores our preferred framerate (see "Pacing" at the top).
+fn format_pods(fps: u32, dmabuf: bool) -> Result<Vec<Vec<u8>>> {
+    use spa::param::format::{FormatProperties, MediaSubtype, MediaType};
+    use spa::pod::{ChoiceValue, Property, PropertyFlags, Value};
+    use spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Fraction, Rectangle};
+
+    let base = spa::pod::object!(
+        spa::utils::SpaTypes::ObjectParamFormat,
+        spa::param::ParamType::EnumFormat,
+        spa::pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
+        spa::pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
+        spa::pod::property!(
+            FormatProperties::VideoFormat,
+            Choice,
+            Enum,
+            Id,
+            VideoFormat::BGRx,
+            VideoFormat::BGRx,
+            VideoFormat::BGRA,
+            VideoFormat::RGBx,
+            VideoFormat::RGBA,
+        ),
+        spa::pod::property!(
+            FormatProperties::VideoSize,
+            Choice,
+            Range,
+            Rectangle,
+            Rectangle {
+                width: 1920,
+                height: 1080
+            },
+            Rectangle {
+                width: 1,
+                height: 1
+            },
+            Rectangle {
+                width: 8192,
+                height: 8192
+            }
+        ),
+        spa::pod::property!(
+            FormatProperties::VideoFramerate,
+            Choice,
+            Range,
+            Fraction,
+            Fraction { num: fps, denom: 1 },
+            Fraction { num: 0, denom: 1 },
+            Fraction {
+                num: 1000,
+                denom: 1
+            }
+        ),
+    );
+
+    let mut objects = Vec::new();
+    if dmabuf {
+        // Same format + a "modifier" (memory layout): LINEAR only.
+        // MANDATORY: only DMA-BUF producers match this pod.
+        // DONT_FIXATE: the producer (the portal) makes the final choice.
+        let mut object = base.clone();
+        object.properties.push(Property {
+            key: FormatProperties::VideoModifier.as_raw(),
+            // (`DONT_FIXATE` is behind a libspa feature: use the raw value.)
+            flags: PropertyFlags::MANDATORY
+                | PropertyFlags::from_bits_retain(spa::sys::SPA_POD_PROP_FLAG_DONT_FIXATE),
+            value: Value::Choice(ChoiceValue::Long(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::Enum {
+                    default: dmabuf::MODIFIER_LINEAR,
+                    alternatives: vec![dmabuf::MODIFIER_LINEAR],
+                },
+            ))),
+        });
+        objects.push(object);
+    }
+    objects.push(base);
+
+    objects
+        .into_iter()
+        .map(|object| {
+            let bytes = spa::pod::serialize::PodSerializer::serialize(
+                std::io::Cursor::new(Vec::new()),
+                &Value::Object(object),
+            )?
+            .0
+            .into_inner();
+            Ok(bytes)
+        })
+        .collect()
 }
 
 /// Returns the first data block (the pixels) of a raw PipeWire buffer.
@@ -376,9 +455,12 @@ fn crop_to_rgba(
     };
 
     let mut pixels = Vec::with_capacity((w * h) as usize);
+    // Each row is first copied in one go: reading GPU memory (DMA-BUF) byte
+    // by byte is very slow, a single big copy is much faster.
+    let mut line = vec![0u8; w as usize * 4];
     for row in y..y + h {
         let start = row as usize * stride + x as usize * 4;
-        let line = bytes.get(start..start + w as usize * 4)?;
+        line.copy_from_slice(bytes.get(start..start + w as usize * 4)?);
         for px in line.chunks_exact(4) {
             let (r, g, b) = if bgr {
                 (px[2], px[1], px[0])

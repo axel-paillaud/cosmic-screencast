@@ -21,6 +21,7 @@ libcosmic = { git = "https://github.com/pop-os/libcosmic", rev = "1e539b94fb891a
     "dbus-config",
 ] }
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+libc = "0.2"
 
 # Optimize dependencies even in debug builds: gifski is very slow unoptimized.
 # Our own code stays in debug mode, so it still compiles fast.

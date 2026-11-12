@@ -1,4 +1,5 @@
 mod capture;
+mod dmabuf;
 mod gif;
 mod portal;
 mod selection;
@@ -41,6 +42,11 @@ struct Args {
     /// Output file. Defaults to ~/Videos/Screencasts/screencast_<date>.gif.
     #[arg(short, long)]
     output: Option<PathBuf>,
+
+    /// Read frames from shared memory instead of GPU memory (DMA-BUF).
+    /// Slower for the desktop; use it if recording fails.
+    #[arg(long)]
+    no_dmabuf: bool,
 
     /// Internal: only show the selection overlay, print the region on stdout
     /// and exit. Used by the parent process, see `pick_region`.
@@ -182,6 +188,7 @@ async fn record(args: Args, region: Region) -> Result<()> {
         region: Some(region),
         logical_size: stream.size,
         fps: args.fps.max(1),
+        dmabuf: !args.no_dmabuf,
     };
     // `fd` is moved into the thread, but `stream` itself stays here so the
     // portal session lives until the end.

@@ -1215,6 +1215,7 @@ dependencies = [
  "gifski",
  "imgref",
  "jiff",
+ "libc",
  "libcosmic",
  "pipewire",
  "rgb",

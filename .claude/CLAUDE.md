@@ -19,8 +19,9 @@ selector.rs  libcosmic app, no main window: one fullscreen transparent layer-she
 selection.rs Custom iced widget: draw / move / resize a rectangle. Look copied from
              the screenshot portal (30% black dim, 4px accent border, corner handles).
 portal.rs    XDG ScreenCast portal (ashpd): gets a PipeWire fd + node id.
-capture.rs   PipeWire stream (own thread): skips frames to reach --fps, crops to the
-             region, converts to RGBA, sends frames on a bounded channel.
+capture.rs   PipeWire stream (own thread), paced by holding buffers (≤ --fps frames/s),
+             crops to the region, converts to RGBA, sends frames on a bounded channel.
+dmabuf.rs    Maps a DMA-BUF (GPU memory) for CPU reads.
 gif.rs       gifski encoder thread, encodes while recording.
 ```
 
@@ -44,8 +45,12 @@ Flow: overlay → portal → PipeWire capture ⇄ channel ⇄ gifski → `~/Vide
   dequeued buffer (raw `pw_buffer` pointers) and a loop timer queues one back every
   1/fps s. Held buffers must be dropped in `remove_buffer` and queued back before the
   stream is destroyed.
-- Frames are **SHM only** (no DMA-BUF modifiers offered), formats BGRx/BGRA/RGBx/RGBA.
-  Respect `chunk().stride()`.
+- **DMA-BUF first, SHM fallback.** Two EnumFormat pods (BGRx/BGRA/RGBx/RGBA): first with
+  modifier LINEAR only (`MANDATORY | DONT_FIXATE`, the portal fixates), then plain SHM.
+  With DMA-BUF the compositor copies GPU → GPU (no stall); `dmabuf.rs` mmaps the fd with
+  `DMA_BUF_IOCTL_SYNC` and we read only the selected rows. GPU memory is uncached:
+  copy whole rows (`copy_from_slice`), never read pixel by pixel (was ~10× slower).
+  `--no-dmabuf` forces SHM. Respect `chunk().stride()` / `offset()`.
 - Region is in **logical** coordinates; frames are physical pixels. `capture.rs` scales
   using the portal's logical size (HiDPI not yet tested).
 - Capture never blocks: `try_send` on a bounded channel, frames dropped if the encoder lags.
