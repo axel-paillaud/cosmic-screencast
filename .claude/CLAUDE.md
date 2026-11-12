@@ -81,9 +81,11 @@ Flow: overlay → portal → PipeWire capture ⇄ channel ⇄ gifski → `~/Vide
   child also exits when its stdin closes (parent died), so it never stays stuck.
   Dim + border are drawn **outside** the region (2 px gap, border outside the gap):
   the recording is cropped to the region, so the overlay never appears in the GIF.
-  Whole screen = `None` all the way to `capture::Options.region` (the frame size
-  is used): libcosmic does NOT call `on_window_resize` for layer surfaces, so the
-  overlay doesn't know the screen size. Corner handles sit on the border's outer
+  Whole screen = `REGION full` / `None`: libcosmic does NOT call `on_window_resize`
+  for layer surfaces, so the overlay doesn't know the screen size. While recording,
+  the overlay draws the frame along the screen edges, and `main.rs` records
+  `Region::inside_screen(portal logical size, FULL_SCREEN_INSET)` (6 px less on each
+  side) to keep it out of the GIF. Corner handles sit on the border's outer
   corners (`handle_centers`).
   Originally a child process because after `cosmic::app::run()` returns, libcosmic's
   Wayland event-loop thread (`SctkEventLoop`) keeps running and touches freed Wayland

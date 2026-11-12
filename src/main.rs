@@ -205,7 +205,14 @@ async fn record(
             // dedicated thread so it doesn't block tokio's async runtime.
             let (stop_tx, stop_rx) = pipewire::channel::channel::<()>();
             let options = capture::Options {
-                region,
+                // Whole screen: the overlay draws a frame along the screen
+                // edges, keep it out of the GIF. (Unknown screen size: record
+                // the full frame, frame included.)
+                region: region.or_else(|| {
+                    stream
+                        .size
+                        .and_then(|size| Region::inside_screen(size, selection::FULL_SCREEN_INSET))
+                }),
                 logical_size: stream.size,
                 fps: args.fps,
                 dmabuf,

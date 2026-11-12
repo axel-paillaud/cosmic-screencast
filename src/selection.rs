@@ -28,6 +28,10 @@ const DIM_ALPHA: f32 = 0.3;
 /// Space between the selection and what we draw around it. Keeps antialiased
 /// edges out of the recording, even with fractional scaling.
 const GAP: f32 = 2.0;
+/// When recording the whole screen, the frame is drawn along the screen
+/// edges, so the recorded area is the screen minus this margin on every side
+/// (in logical pixels). Used by `main.rs` to compute that area.
+pub const FULL_SCREEN_INSET: u32 = (GAP + BORDER_WIDTH) as u32;
 
 pub struct Selection<'a, Message> {
     rect: Option<Rectangle>,
@@ -240,13 +244,16 @@ impl<Message> Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_,
             );
         };
 
-        let Some(sel) = self.rect else {
-            // Recording the whole screen: nothing to show.
+        let sel = match self.rect {
+            Some(sel) => sel,
+            // Recording the whole screen: a frame along the screen edges (the
+            // recorded area is inset accordingly, see `FULL_SCREEN_INSET`).
+            None if self.locked => expand(bounds, -(GAP + BORDER_WIDTH)),
             // Selecting, nothing selected yet: dim the whole screen.
-            if !self.locked {
+            None => {
                 fill(renderer, bounds, dim);
+                return;
             }
-            return;
         };
 
         // Dim around the selection (+ gap) with 4 bands: top, bottom, left,

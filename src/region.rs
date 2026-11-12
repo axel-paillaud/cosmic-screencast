@@ -30,6 +30,20 @@ impl Region {
         }
     }
 
+    /// The whole screen minus `inset` on every side. `screen_size` is in
+    /// logical pixels. `None` if the screen is too small.
+    pub fn inside_screen(screen_size: (i32, i32), inset: u32) -> Option<Region> {
+        let (w, h) = screen_size;
+        let width = u32::try_from(w).ok()?.checked_sub(2 * inset)?;
+        let height = u32::try_from(h).ok()?.checked_sub(2 * inset)?;
+        (width > 0 && height > 0).then_some(Region {
+            x: inset,
+            y: inset,
+            width,
+            height,
+        })
+    }
+
     /// Converts a logical region to physical pixels of a `frame_size` frame,
     /// clamped so it fits inside the frame.
     ///
@@ -91,6 +105,16 @@ mod tests {
         assert!(Region::parse("10,20,0,200").is_err()); // zero width
         assert!(Region::parse("10,-20,300,200").is_err()); // negative
         assert!(Region::parse("a,b,c,d").is_err());
+    }
+
+    #[test]
+    fn inside_screen_removes_the_margin() {
+        assert_eq!(
+            Region::inside_screen((2560, 1440), 6),
+            Some(region(6, 6, 2548, 1428))
+        );
+        assert_eq!(Region::inside_screen((10, 10), 6), None);
+        assert_eq!(Region::inside_screen((-1, 10), 0), None);
     }
 
     #[test]
